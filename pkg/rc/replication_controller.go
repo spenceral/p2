@@ -18,6 +18,8 @@ import (
 	"github.com/square/p2/pkg/scheduler"
 	"github.com/square/p2/pkg/store/consul"
 	"github.com/square/p2/pkg/store/consul/rcstore"
+	"github.com/square/p2/pkg/store/consul/statusstore"
+	"github.com/square/p2/pkg/store/consul/statusstore/rcstatus"
 	"github.com/square/p2/pkg/store/consul/transaction"
 	"github.com/square/p2/pkg/types"
 	"github.com/square/p2/pkg/util"
@@ -101,6 +103,7 @@ type replicationController struct {
 	logger logging.Logger
 
 	consulStore   consulStore
+	rcStatusStore rcstatus.ConsulStore
 	auditLogStore AuditLogStore
 	txner         transaction.Txner
 	rcWatcher     ReplicationControllerWatcher
@@ -116,6 +119,7 @@ type ReplicationControllerWatcher interface {
 func New(
 	fields fields.RC,
 	consulStore consulStore,
+	rcStatusStore rcstatus.ConsulStore,
 	auditLogStore AuditLogStore,
 	txner transaction.Txner,
 	rcWatcher ReplicationControllerWatcher,
@@ -133,6 +137,7 @@ func New(
 
 		logger:        logger,
 		consulStore:   consulStore,
+		rcStatusStore: rcStatusStore,
 		auditLogStore: auditLogStore,
 		txner:         txner,
 		rcWatcher:     rcWatcher,
@@ -277,25 +282,12 @@ func (rc *replicationController) addPods(current types.PodLocations, eligible []
 			txn, cancelFunc = rc.newAuditingTransaction(context.Background(), txn.Nodes())
 		}
 		if len(possibleSorted) < i+1 {
-			errMsg := fmt.Sprintf(
-				"Not enough nodes to meet desire: %d replicas desired, %d currentNodes, %d eligible. Scheduled on %d nodes instead.",
-				rc.ReplicasDesired, len(currentNodes), len(eligible), i,
-			)
-			err := rc.alerter.Alert(rc.alertInfo(errMsg))
+			err := rc.doNotEnoughNodes(currentNodes, eligible, i, txn)
 			if err != nil {
-				rc.logger.WithError(err).Errorln("Unable to send alert")
+				return util.Errorf("Could not handle not enough nodes case: %s", err)
 			}
 
-			// commit any queued operations
-			ok, resp, txnErr := txn.Commit(rc.txner)
-			switch {
-			case txnErr != nil:
-				return txnErr
-			case !ok:
-				return util.Errorf("could not schedule pods due to transaction violation: %s", transaction.TxnErrorsToString(resp.Errors))
-			}
-
-			return util.Errorf(errMsg)
+			return nil
 		}
 		scheduleOn := possibleSorted[i]
 
@@ -314,6 +306,74 @@ func (rc *replicationController) addPods(current types.PodLocations, eligible []
 	}
 
 	return nil
+}
+
+func (rc *replicationController) doNotEnoughNodes(currentNodes []types.NodeName, eligibleNodes []types.NodeName, numScheduledNodes int, txn *auditingTransaction) error {
+	var err error = nil
+	if rc.AllocationStrategy == fields.CattleStrategy {
+		err = rc.doNotEnoughCattleNodes(currentNodes, eligibleNodes, numScheduledNodes)
+	} else {
+		err = rc.doNotEnoughPetNodes(currentNodes, eligibleNodes, numScheduledNodes)
+	}
+
+	// commit any queued operations
+	ok, resp, txnErr := txn.Commit(rc.txner)
+	switch {
+	case txnErr != nil:
+		return txnErr
+	case !ok:
+		return util.Errorf("could not schedule pods due to transaction violation: %s", transaction.TxnErrorsToString(resp.Errors))
+	}
+
+	return err
+}
+
+func (rc *replicationController) doNotEnoughCattleNodes(currentNodes []types.NodeName, eligibleNodes []types.NodeName, numScheduledNodes int) error {
+	rcStatus, _, err := rc.rcStatusStore.Get(rc.ID())
+	isNoNodeTransferInProgress := (err != nil && statusstore.IsNoStatus(err)) ||
+		(err == nil && rcStatus.NodeTransfer == nil)
+	if isNoNodeTransferInProgress {
+		rc.mu.Lock()
+		newNodes, err := rc.scheduler.AllocateNodes(rc.Manifest, rc.NodeSelector, len(currentNodes)+1)
+		rc.mu.Unlock()
+		if err != nil || len(newNodes) < 1 {
+			errMsg := fmt.Sprintf(
+				"Unable to allocate nodes over grpc: %d replicas desired, %d currentNodes, %d eligible. Scheduled on %d nodes instead. Error: %s",
+				rc.ReplicasDesired, len(currentNodes), len(eligibleNodes), numScheduledNodes, err,
+			)
+			err := rc.alerter.Alert(rc.alertInfo(errMsg))
+			if err != nil {
+				rc.logger.WithError(err).Errorln("Unable to send alert")
+			}
+
+			return util.Errorf(errMsg)
+		}
+
+		// Right now we do not support multiple node transfers, so we just
+		// write the first
+		rcStatus.NodeTransfer.NewNode = newNodes[0]
+		err = rc.rcStatusStore.Set(rc.ID(), rcStatus)
+		if err != nil {
+			return util.Errorf("Could not write new node to store: %s", err)
+		}
+	} else if err != nil {
+		return util.Errorf("Unable to get rc status from status store: %s", err)
+	}
+
+	return nil
+}
+
+func (rc *replicationController) doNotEnoughPetNodes(currentNodes []types.NodeName, eligibleNodes []types.NodeName, numScheduledNodes int) error {
+	errMsg := fmt.Sprintf(
+		"Not enough nodes to meet desire: %d replicas desired, %d currentNodes, %d eligible. Scheduled on %d nodes instead.",
+		rc.ReplicasDesired, len(currentNodes), len(eligibleNodes), numScheduledNodes,
+	)
+	err := rc.alerter.Alert(rc.alertInfo(errMsg))
+	if err != nil {
+		rc.logger.WithError(err).Errorln("Unable to send alert")
+	}
+
+	return util.Errorf(errMsg)
 }
 
 // Generates an alerting.AlertInfo struct. Includes information relevant to
