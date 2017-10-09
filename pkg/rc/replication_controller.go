@@ -563,10 +563,14 @@ func (rc *replicationController) checkForIneligible(current types.PodLocations, 
 	}
 
 	if len(ineligibleCurrent) > 0 {
-		errMsg := fmt.Sprintf("RC has scheduled %d ineligible nodes: %s", len(ineligibleCurrent), ineligibleCurrent)
-		err := rc.alerter.Alert(rc.alertInfo(errMsg))
-		if err != nil {
-			rc.logger.WithError(err).Errorln("Unable to send alert")
+		if rc.AllocationStrategy == fields.CattleStrategy {
+			rc.allocate(current.Nodes, eligible, len(current))
+		} else {
+			errMsg := fmt.Sprintf("RC has scheduled %d ineligible nodes: %s", len(ineligibleCurrent), ineligibleCurrent)
+			err := rc.alerter.Alert(rc.alertInfo(errMsg))
+			if err != nil {
+				rc.logger.WithError(err).Errorln("Unable to send alert")
+			}
 		}
 	}
 }
