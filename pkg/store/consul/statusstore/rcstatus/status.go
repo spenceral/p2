@@ -9,7 +9,7 @@ import (
 )
 
 type RCStatus struct {
-	NodeTransfer NodeTransfer `json:"node_transfer"`
+	NodeTransfer *NodeTransfer `json:"node_transfer"`
 }
 
 type NodeTransfer struct {
