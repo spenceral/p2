@@ -12,7 +12,7 @@ import (
 func TestSetAndGetStatus(t *testing.T) {
 	store := newFixture()
 	testStatus := RCStatus{
-		NodeTransfer: NodeTransfer{
+		NodeTransfer: &NodeTransfer{
 			OldNode: types.NodeName("old.123"),
 			NewNode: types.NodeName("new.456"),
 		},
@@ -45,7 +45,7 @@ func TestSetAndGetStatus(t *testing.T) {
 func TestDelete(t *testing.T) {
 	store := newFixture()
 	testStatus := RCStatus{
-		NodeTransfer: NodeTransfer{
+		NodeTransfer: &NodeTransfer{
 			OldNode: types.NodeName("old.123"),
 			NewNode: types.NodeName("new.456"),
 		},
@@ -64,7 +64,7 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("Unexpected error getting status: %s", err)
 	}
 
-	if status.NodeTransfer != testStatus.NodeTransfer {
+	if *(status.NodeTransfer) != *(testStatus.NodeTransfer) {
 		t.Fatalf("Expected status.NodeTransfer to be %v, but was %v", testStatus.NodeTransfer, status.NodeTransfer)
 	}
 
