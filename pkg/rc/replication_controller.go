@@ -333,28 +333,9 @@ func (rc *replicationController) doNotEnoughCattleNodes(currentNodes []types.Nod
 	isNoNodeTransferInProgress := (err != nil && statusstore.IsNoStatus(err)) ||
 		(err == nil && rcStatus.NodeTransfer == nil)
 	if isNoNodeTransferInProgress {
-		rc.mu.Lock()
-		newNodes, err := rc.scheduler.AllocateNodes(rc.Manifest, rc.NodeSelector, len(currentNodes)+1)
-		rc.mu.Unlock()
-		if err != nil || len(newNodes) < 1 {
-			errMsg := fmt.Sprintf(
-				"Unable to allocate nodes over grpc: %d replicas desired, %d currentNodes, %d eligible. Scheduled on %d nodes instead. Error: %s",
-				rc.ReplicasDesired, len(currentNodes), len(eligibleNodes), numScheduledNodes, err,
-			)
-			err := rc.alerter.Alert(rc.alertInfo(errMsg))
-			if err != nil {
-				rc.logger.WithError(err).Errorln("Unable to send alert")
-			}
-
-			return util.Errorf(errMsg)
-		}
-
-		// Right now we do not support multiple node transfers, so we just
-		// write the first
-		rcStatus.NodeTransfer.NewNode = newNodes[0]
-		err = rc.rcStatusStore.Set(rc.ID(), rcStatus)
+		err = rc.allocate(currentNodes, eligibleNodes, numScheduledNodes)
 		if err != nil {
-			return util.Errorf("Could not write new node to store: %s", err)
+			return util.Errorf("Unable to allocate additional cattle nodes: %s", err)
 		}
 	} else if err != nil {
 		return util.Errorf("Unable to get rc status from status store: %s", err)
@@ -374,6 +355,32 @@ func (rc *replicationController) doNotEnoughPetNodes(currentNodes []types.NodeNa
 	}
 
 	return util.Errorf(errMsg)
+}
+
+func (rc *replicationController) allocate(currentNodes []types.NodeName, eligibleNodes []types.NodeName, numScheduledNodes int) error {
+	rc.mu.Lock()
+	newNodes, err := rc.scheduler.AllocateNodes(rc.Manifest, rc.NodeSelector, len(currentNodes)+1)
+	rc.mu.Unlock()
+	if err != nil || len(newNodes) < 1 {
+		errMsg := fmt.Sprintf(
+			"Unable to allocate nodes over grpc: %d replicas desired, %d currentNodes, %d eligible. Scheduled on %d nodes instead. Error: %s",
+			rc.ReplicasDesired, len(currentNodes), len(eligibleNodes), numScheduledNodes, err,
+		)
+		err := rc.alerter.Alert(rc.alertInfo(errMsg))
+		if err != nil {
+			rc.logger.WithError(err).Errorln("Unable to send alert")
+		}
+
+		return util.Errorf(errMsg)
+	}
+
+	// Right now we do not support multiple node transfers, so we just
+	// write the first
+	rcStatus.NodeTransfer.NewNode = newNodes[0]
+	err = rc.rcStatusStore.Set(rc.ID(), rcStatus)
+	if err != nil {
+		return util.Errorf("Could not write new node to store: %s", err)
+	}
 }
 
 // Generates an alerting.AlertInfo struct. Includes information relevant to
