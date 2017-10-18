@@ -11,6 +11,8 @@ import (
 
 	"github.com/square/p2/pkg/alerting"
 	grpc_scheduler "github.com/square/p2/pkg/grpc/scheduler/client"
+	"github.com/square/p2/pkg/health"
+	"github.com/square/p2/pkg/health/checker"
 	"github.com/square/p2/pkg/labels"
 	"github.com/square/p2/pkg/logging"
 	"github.com/square/p2/pkg/manifest"
@@ -112,6 +114,7 @@ type replicationController struct {
 	scheduler     Scheduler
 	podApplicator Labeler
 	alerter       alerting.Alerter
+	healthChecker checker.ConsulHealthChecker
 }
 
 type ReplicationControllerWatcher interface {
@@ -129,6 +132,7 @@ func New(
 	podApplicator Labeler,
 	logger logging.Logger,
 	alerter alerting.Alerter,
+	healthChecker checker.ConsulHealthChecker,
 ) ReplicationController {
 	if alerter == nil {
 		alerter = alerting.NewNop()
@@ -146,6 +150,7 @@ func New(
 		scheduler:     scheduler,
 		podApplicator: podApplicator,
 		alerter:       alerter,
+		healthChecker: healthChecker,
 	}
 }
 
@@ -202,6 +207,10 @@ func (rc *replicationController) meetDesires() error {
 	// If we're disabled, we do nothing, nor is it an error
 	// (it's a normal possibility to be disabled)
 	if rc.Disabled {
+		// SPENCER if a node transfer is happening,
+		// halt it
+		// no-op if current == replicasDesired
+		// If the node transfer scheduled a new healthy node, unschedule the ineligible one
 		return nil
 	}
 
@@ -217,20 +226,26 @@ func (rc *replicationController) meetDesires() error {
 	rc.logger.NoFields().Infof("Currently on nodes %s", current)
 
 	nodesChanged := false
+	// SPENCER replicas desired changes here spencer: halt the transfer??
 	switch {
 	case rc.ReplicasDesired > len(current):
+		// SPENCER new node is not to be considered!! if a node transfer is in progress
 		err := rc.addPods(current, eligible)
 		if err != nil {
 			return err
 		}
 		nodesChanged = true
 	case len(current) > rc.ReplicasDesired:
+		// SPENCER halt transfer, wait for it to exit
+		// SPENCER unschedule with a pref for the ineligible
+		// SPENCER the transfer may have had time to schedule a new healthy node
 		err := rc.removePods(current, eligible)
 		if err != nil {
 			return err
 		}
 		nodesChanged = true
 	default:
+		// SPENCER should be a noop
 		rc.logger.NoFields().Debugln("Taking no action")
 	}
 
@@ -241,9 +256,12 @@ func (rc *replicationController) meetDesires() error {
 		}
 	}
 
-	err = rc.checkForIneligible(current, eligible)
-	if err != nil {
-		return util.Errorf("Error handling ineligible nodes: %s", err)
+	ineligible := rc.checkForIneligible(current, eligible)
+	if len(ineligible) > 0 {
+		err := rc.transferNodes(ineligible)
+		if err != nil {
+			return err
+		}
 	}
 
 	return rc.ensureConsistency(current)
@@ -488,7 +506,7 @@ func (rc *replicationController) ensureConsistency(current types.PodLocations) e
 	return nil
 }
 
-func (rc *replicationController) checkForIneligible(current types.PodLocations, eligible []types.NodeName) error {
+func (rc *replicationController) checkForIneligible(current types.PodLocations, eligible []types.NodeName) []types.NodeName {
 	// Check that the RC doesn't have any current nodes that are ineligible.
 	var ineligibleCurrent []types.NodeName
 	for _, currentPod := range current {
@@ -505,14 +523,7 @@ func (rc *replicationController) checkForIneligible(current types.PodLocations, 
 		}
 	}
 
-	if len(ineligibleCurrent) > 0 {
-		err := rc.transferNodes(ineligibleCurrent)
-		if err != nil {
-			return util.Errorf("Error transferring nodes: %s", err)
-		}
-	}
-
-	return nil
+	return ineligibleCurrent
 }
 
 func (rc *replicationController) eligibleNodes() ([]types.NodeName, error) {
@@ -624,39 +635,68 @@ func (rc *replicationController) unschedule(txn *auditingTransaction, node types
 	return nil
 }
 
-func (rc *replicationController) transferNodes(ineligibleCurrent []types.NodeName) error {
-	var err error
-	if rc.AllocationStrategy == fields.CattleStrategy {
-		err = rc.transferCattleNodes(ineligibleCurrent)
-	} else {
-		err = rc.transferPetNodes(ineligibleCurrent)
-	}
+func (rc *replicationController) transferNodes(ineligible []types.NodeName) error {
+	inProg, err := rc.isNodeTransferInProgress()
 	if err != nil {
-		return util.Errorf("Unable to transfer nodes: %s", err)
+		return err
 	}
 
-	return nil
-}
-
-func (rc *replicationController) transferCattleNodes(ineligibleCurrent []types.NodeName) error {
-	if len(ineligibleCurrent) < 1 {
-		return util.Errorf("Need at least one ineligible node to transfer from")
-	}
-
-	status, queryMeta, statusErr := rc.rcStatusStore.Get(rc.ID())
-	if statusErr != nil && !statusstore.IsNoStatus(statusErr) {
-		return util.Errorf("Unable to get rc status: %s", statusErr)
-	}
-
-	if status.NodeTransfer != nil {
-		// Node transfer already in progress
+	if inProg {
+		// start go routine if it has not been started
 		return nil
 	}
 
-	nodesRequested := 1 // We only support one node transfer at a time right now
+	// init channels? maybe or something
+
+	newNode, err := rc.updateAllocationsAndReschedule(ineligibleNodes)
+	if err != nil {
+		return err
+	}
+	// go rc.watchHealth()
+	// do something with the channels?
+}
+
+func (rc *replicationController) updateAllocationsAndReschedule(ineligible []types.NodeName) (types.NodeName, error) {
+	if rc.AllocationStrategy != fields.CattleStrategy {
+		errMsg := fmt.Sprintf("Non-cattle RC has scheduled %d ineligible nodes: %s", len(ineligibleCurrent), ineligibleCurrent)
+		err := rc.alerter.Alert(rc.alertInfo(errMsg))
+		if err != nil {
+			rc.logger.WithError(err).Errorln("Unable to send alert")
+		}
+		return nil, err
+	}
+
+	newNode, err := rc.updateAllocations(ineligible)
+	if err != nil {
+		return nil, err
+	}
+
+	err := rc.scheduleWithoutLabel(newNode)
+	if err != nil {
+		return nil, err
+	}
+
+	return newNode, nil
+}
+
+func (rc *replicationController) updateAllocations(ineligible []types.NodeName) (types.NodeName, error) {
+	if len(ineligible) < 1 {
+		return nil, util.Errorf("Need at least one ineligible node to transfer from, had 0")
+	}
+
 	rc.mu.Lock()
-	newNodes, err := rc.scheduler.AllocateNodes(rc.Manifest, rc.NodeSelector, nodesRequested)
+	man := rc.Manifest
+	sel := rc.NodeSelector
 	rc.mu.Unlock()
+
+	oldNode := ineligible[0]
+	err = rc.scheduler.DeallocateNodes(sel, []types.NodeName{oldNode})
+	if err != nil {
+		return nil, util.Errorf("Could not deallocate from %s: %s", oldNode, err)
+	}
+
+	nodesRequested := 1 // We only support one node transfer at a time right now
+	newNodes, err := rc.scheduler.AllocateNodes(man, sel, nodesRequested)
 	if err != nil || len(newNodes) < 1 {
 		errMsg := fmt.Sprintf("Unable to allocate nodes over grpc: %s", err)
 		err := rc.alerter.Alert(rc.alertInfo(errMsg))
@@ -664,41 +704,132 @@ func (rc *replicationController) transferCattleNodes(ineligibleCurrent []types.N
 			rc.logger.WithError(err).Errorln("Unable to send alert")
 		}
 
-		return util.Errorf(errMsg)
+		return nil, util.Errorf(errMsg)
 	}
 
-	var modifyIndex uint64
-	if statusErr != nil && statusstore.IsNoStatus(statusErr) {
-		modifyIndex = 0
-	} else {
-		modifyIndex = queryMeta.LastIndex
-	}
+	newNode := newNodes[0]
 
 	status.NodeTransfer = &rcstatus.NodeTransfer{
-		// Again, we only support one node transfer at a time so just take the first old and new
-		OldNode: ineligibleCurrent[0],
-		NewNode: newNodes[0],
+		OldNode: oldNode,
+		NewNode: newNode,
 	}
+
 	writeCtx, writeCancel := transaction.New(context.Background())
 	defer writeCancel()
-	err = rc.rcStatusStore.CASTxn(writeCtx, rc.ID(), modifyIndex, status)
+	err = rc.rcStatusStore.CASTxn(writeCtx, rc.ID(), 0, status)
 	if err != nil {
-		return util.Errorf("Could not write new node to store: %s", err)
+		return nil, util.Errorf("Could not write new node to store: %s", err)
 	}
 
 	err = transaction.MustCommit(writeCtx, rc.txner)
 	if err != nil {
-		return util.Errorf("Could not commit CASTxn: %s", err)
+		return nil, util.Errorf("Could not commit CASTxn: %s", err)
+	}
+
+	return newNode, nil
+}
+
+func (rc *replicationController) scheduleWithoutLabel(newNode types.NodeName) error {
+	writeCtx, writeCancel := transaction.New(context.Background())
+	defer writeCancel()
+
+	rc.logger.NoFields().Infof("Scheduling on %s", newNode)
+	rc.mu.Lock()
+	manifest := rc.Manifest
+	rc.mu.Unlock()
+
+	err := rc.consulStore.SetPodTxn(txn.Context(), consul.INTENT_TREE, scheduleOn, manifest)
+	if err != nil {
+		return err
+	}
+
+	ok, resp, err := transaction.Commit(ctx, rc.txner)
+	switch {
+	case err != nil:
+		return err
+	case !ok:
+		return util.Errorf("could not schedule %s due to transaction violation: %s", newNode, transaction.TxnErrorsToString(resp.Errors))
+	}
+
+	return nil
+
+}
+
+func (rc *replicationController) isNodeTransferInProgress() (bool, error) {
+	status, _, err := rc.rcStatusStore.Get(rc.ID())
+	if err != nil && !statusstore.IsNoStatus(err) {
+		return false, err
+	}
+
+	return status.NodeTransfer != nil, nil
+}
+
+func (rc *replicationController) waitForRealityAndHealth(nodeName types.NodeName, resultCh chan string, errCh <-chan error, quitCh <-chan struct{}) {
+	rc.mu.Lock()
+	podID := rc.Manifest.ID()
+	rc.mu.Unlock()
+
+	// Wait for reality/
+	var man manifest.Manifest
+	for man == nil {
+		man, _, err := rc.consulStore.Pod(consul.REALITY_TREE, nodeName, podID)
+		if err != nil && err != pods.NoCurrentManifest {
+			return err
+		}
+	}
+
+	// Wait for health/
+	// want to use healthChecker.WatchNodeService here. Might want to refactor WatchNodeService
+	isHealthy := false
+	for !isHealthy {
+		// TODO check what the service ID arg is supposed to be here
+		healthMap := rc.healthChecker.Service(podID)
+		newNodeHealthResult := healthMap[nodeName]
+		isHealthy = newNodeHealthResult.Status == health.Passing
+	}
+}
+
+func (rc *replicationController) finalizeCompleteTransfer(newNode types.NodeName) error {
+	current, err := rc.CurrentPods()
+	if err != nil {
+		return err
+	}
+
+	txn, cancelFunc := rc.newAuditingTransaction(context.Background(), current)
+	defer cancelFunc()
+
+	// TODO double check what this does to make sure this is somethin I want to do
+	txn.AddNode(node)
+
+	labelKey := labels.MakePodLabelKey(node, manifest.ID())
+	err := rc.podApplicator.SetLabelsTxn(ctx, labels.POD, labelKey, rc.computePodLabels())
+	if err != nil {
+		return err
+	}
+
+	err := rc.unschedule(txn, oldNode)
+	if err != nil {
+		return err
+	}
+
+	// TODO delete node transfer
+
+	ok, resp, err := txn.Commit(rc.txner)
+	switch {
+	case err != nil:
+		return err
+	case !ok:
+		return util.Errorf("could not finalize node transfer due to a transaction violation: %s", transaction.TxnErrorsToString(resp.Errors))
 	}
 
 	return nil
 }
 
-func (rc *replicationController) transferPetNodes(ineligibleCurrent []types.NodeName) error {
-	errMsg := fmt.Sprintf("RC has scheduled %d ineligible nodes: %s", len(ineligibleCurrent), ineligibleCurrent)
-	err := rc.alerter.Alert(rc.alertInfo(errMsg))
-	if err != nil {
-		rc.logger.WithError(err).Errorln("Unable to send alert")
-	}
-	return err
+func (rc *replicationController) rollbackIncompleteTransfer() error {
+	// Unschedule
+	// very carefully by looking up intent record with session?
+	// I might need the session that I used when I originally scheduled. That might need to be passed to the routine
+
+	// Delete node transfer?
+	return nil
 }
