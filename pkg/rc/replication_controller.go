@@ -730,6 +730,7 @@ func (rc *replicationController) unschedule(txn *auditingTransaction, rcFields f
 }
 
 func (rc *replicationController) transferNodes(rcFields fields.RC, current types.PodLocations, eligible []types.NodeName, ineligible []types.NodeName) error {
+	// TODO this is probably not the correct thing to look for...
 	if rc.nodeTransfer.quit != nil {
 		// a node transfer to replace the ineligible node is already in progress
 		return nil
@@ -994,6 +995,8 @@ func (rc *replicationController) doBackgroundNodeTransfer(rcFields fields.RC, lo
 			logger.WithError(alertErr).Errorln("Unable to send alert")
 		}
 	} else {
+		// TODO rephrase this to suggest that watch health has stopped
+		// prematurely but will be resumed
 		logger.Infof("Node transfer was canceled: %s.", rollbackReason)
 		// We'll retry the node transfer on the next call of meetDesires using
 		// the same old and new nodes because they have been written to the
@@ -1009,6 +1012,7 @@ func (rc *replicationController) watchHealth(rcFields fields.RC, logger logging.
 
 	healthQuitCh := make(chan struct{})
 	defer close(healthQuitCh)
+	// TODO defer isWatchingHealth = false
 
 	// these channels are closed by WatchPodOnNode
 	resultCh, errCh := rc.healthChecker.WatchPodOnNode(rc.nodeTransfer.newNode, rcFields.Manifest.ID(), healthQuitCh)
