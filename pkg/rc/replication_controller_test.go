@@ -1006,14 +1006,27 @@ func TestRemovePodsDisabled(t *testing.T) {
 }
 
 func nodeTransferSetup(applicator testApplicator, rc *replicationController, rcFields fields.RC) error {
+	// Get rid of the labels configured in setup(t), we'll set our own
+	err := applicator.RemoveLabel(labels.POD, "some_id", "some_key")
+	if err != nil {
+		return err
+	}
+	err = applicator.RemoveLabel(labels.NODE, "some_id", "some_key")
+	if err != nil {
+		return err
+	}
 	for i := 0; i < 3; i++ {
-		err := applicator.SetLabel(labels.NODE, fmt.Sprintf("node%d", i), "nodeQuality", "good")
+		err = applicator.SetLabel(labels.POD, fmt.Sprintf("node%d/some_id", i), "some_key", "some_value")
+		if err != nil {
+			return err
+		}
+		err = applicator.SetLabel(labels.NODE, fmt.Sprintf("node%d", i), "nodeQuality", "good")
 		if err != nil {
 			return err
 		}
 	}
 
-	err := rc.meetDesires(rcFields)
+	err = rc.meetDesires(rcFields)
 	if err != nil {
 		return err
 	}
@@ -1031,11 +1044,6 @@ func nodeTransferSetup(applicator testApplicator, rc *replicationController, rcF
 	// RC has 3 "current" nodes and 3 desired replicas, but only 2 of
 	// those nodes meet the node selector's criteria
 	err = applicator.SetLabel(labels.NODE, "node2", "nodeQuality", "bad")
-	if err != nil {
-		return err
-	}
-
-	err = rc.meetDesires(rcFields)
 	if err != nil {
 		return err
 	}
@@ -1086,92 +1094,6 @@ func TestNodeTransferNoopIfStaticStrategy(t *testing.T) {
 	}
 }
 
-func TestNodeTransferNoopIfLockHeld(t *testing.T) {
-	_, _, applicator, rc, _, _, _, closeFn := setup(t)
-	defer closeFn()
-
-	rcFields := fields.RC{
-		ID:                 rc.rcID,
-		ReplicasDesired:    3,
-		Manifest:           testManifest(),
-		Disabled:           false,
-		NodeSelector:       klabels.Everything().Add("nodeQuality", klabels.EqualsOperator, []string{"good"}),
-		AllocationStrategy: fields.DynamicStrategy,
-	}
-
-	err := nodeTransferSetup(applicator, rc, rcFields)
-	current, err := rc.CurrentPods()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// however, acquire the lock first to prevent a node transfer from happening
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctx, session, err := consul.SessionContext(ctx, rc.consulClient, "test-no-node-transfer-when-lock-held")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	unlocker, err := rc.rcLocker.LockForMutation(rc.rcID, session)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Log("we got the lock")
-
-	healthMap := make(map[types.NodeName]health.Result, len(current))
-	for _, node := range current.Nodes() {
-		healthMap[node] = health.Result{Status: health.Passing}
-	}
-	rc.healthChecker = fake_checker.NewSingleService("some_pod", healthMap)
-
-	ok, err := rc.attemptNodeTransfer(rcFields, current, "node2", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ok {
-		t.Fatal("expected node transfer to skip when locked")
-	}
-
-	// Confirm that the RC is scheduled on the same nodes
-	newCurrent, err := rc.CurrentPods()
-	if err != nil {
-		t.Fatal(err)
-	}
-	actual := types.NewNodeSet(newCurrent.Nodes()...)
-	expected := types.NewNodeSet(current.Nodes()...)
-	if !actual.Equal(expected) {
-		t.Fatalf("expected current nodes to be %v, was %v", expected, actual)
-	}
-
-	// now release the lock and see if a node transfer occurs
-	err = unlocker.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = rc.meetDesires(rcFields)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	current, err = rc.CurrentPods()
-	if err != nil {
-		t.Fatal(err)
-	}
-	newNodeFound := false
-	for _, node := range current.Nodes() {
-		if node == "node2" {
-			t.Fatalf("expected not to find ineligible node2 after transfer, got %v", current.Nodes())
-		} else if node == newTransferNode {
-			newNodeFound = true
-		}
-	}
-	if !newNodeFound {
-		t.Fatalf("expected to find new transfer node, got %v", current.Nodes())
-	}
-}
-
 func TestNodeTransferNoopIfPodsUnhealthy(t *testing.T) {
 	_, _, applicator, rc, _, _, _, closeFn := setup(t)
 	defer closeFn()
@@ -1204,7 +1126,7 @@ func TestNodeTransferNoopIfPodsUnhealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok {
-		t.Fatal("expected node transfer to skip when locked")
+		t.Fatal("expected node transfer to skip when pods unhealthy")
 	}
 
 	// Confirm that the RC is scheduled on the same nodes

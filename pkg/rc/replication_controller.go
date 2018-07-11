@@ -651,9 +651,9 @@ func (rc *replicationController) unschedule(txn *auditingTransaction, rcFields f
 }
 
 // attemptNodeTransfer will transactionally remove a pod on an ineligible node
-// and add a pod on a new node if the following conditions are met:
-//   1) The ineligible pod is unhealthy OR all of the RC's pods are healthy
-//   2) The RC can acquire a mutation lock on its ID
+// and add a pod on a new node if one of the following conditions are met:
+//   1) The ineligible pod is unhealthy
+//   2) The cluster's pods are all healthy
 // If the conditions are not met, the function will be called again on the next
 // call of meetDesires() should a node still be ineligible. It returns true
 // when a node transfer occurs
@@ -666,25 +666,6 @@ func (rc *replicationController) attemptNodeTransfer(rcFields fields.RC, current
 		rc.logger.Infoln("skipping node transfer; node transfer health requirement not met")
 		return false, nil
 	}
-
-	_, session, err := consul.SessionContext(context.Background(), rc.consulClient, fmt.Sprintf("rc-node-transfer-%s", rc.rcID))
-	if err != nil {
-		rc.logger.WithError(err).Errorln("could not create a session to acquire rc lock")
-		return false, err
-	}
-	// Node transfers do not mutate the RC's state, but we attempt to acquire
-	// the lock to ensure that we do not perform a transfer during a rolling
-	// update. This avoids races between the two's health checks and scheduling
-	unlocker, err := rc.rcLocker.LockForMutation(rc.rcID, session)
-	switch {
-	case consul.IsAlreadyLocked(err):
-		rc.logger.Infoln("skipping node transfer; rc mutation lock is already held")
-		return false, nil
-	case err != nil:
-		rc.logger.WithError(err).Errorln("could not acquire rc mutatation lock for node transfer")
-		return false, err
-	}
-	defer unlocker.Unlock()
 
 	err = rc.swapNodes(rcFields, current, ineligible, allocAttempts)
 	if err != nil {
@@ -702,7 +683,7 @@ func (rc *replicationController) attemptNodeTransfer(rcFields fields.RC, current
 
 // isTransferMinHealthMet returns true if either the ineligible node is unhealthy
 // (in which case a node transfer would not reduce the cluster's health) or if
-// all of the RC's current pods are healthy (in which case the cluster can
+// all of the cluster's pods are healthy (in which case the cluster can
 // tolerate one pod down)
 func (rc *replicationController) isTransferMinHealthMet(rcFields fields.RC, current types.PodLocations, ineligible types.NodeName) (bool, error) {
 	service := rcFields.Manifest.ID().String()
@@ -718,15 +699,42 @@ func (rc *replicationController) isTransferMinHealthMet(rcFields fields.RC, curr
 		// cluster
 		return true, nil
 	}
-	for _, pod := range current {
-		hlth, ok := healths[pod.Node]
+	nodes, err := rc.nodesInCluster(rcFields)
+	if err != nil {
+		return false, util.Errorf("could not get cluster's current nodes: %s", err)
+	}
+	rc.logger.Debugf("checking health of all the cluster's nodes: %v", nodes)
+	for _, node := range nodes {
+		hlth, ok := healths[node]
 		if !ok {
-			return false, util.Errorf("no health result returned for %s", pod.Node)
+			return false, util.Errorf("no health result returned for %s", node)
 		} else if hlth.Status != health.Passing {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// nodesInCluster returns a list of all nodes in the same pod cluster as the RC
+func (rc *replicationController) nodesInCluster(rcFields fields.RC) ([]types.NodeName, error) {
+	sel := klabels.Everything()
+	for k, v := range rcFields.PodLabels {
+		sel.Add(k, klabels.EqualsOperator, []string{v})
+	}
+	matches, err := rc.podApplicator.GetMatches(sel, labels.POD)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]types.NodeName, len(matches))
+	for i, pod := range matches {
+		// ID will be something like <nodename>/<podid>.
+		node, _, err := labels.NodeAndPodIDFromPodLabel(pod)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = node
+	}
+	return result, nil
 }
 
 // swapNodes allocates a node, deallocates the inelgible node, and
