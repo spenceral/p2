@@ -165,9 +165,9 @@ func main() {
 		Worse, this new nice level may propagate into a container, causing the container to be unable to set its nice level back to 0.
 		This has been observed to cause containers to fail to start.
 	*/
-	if err := unix.Setpgid(0, 0); err != nil {
-		log.Fatal(err)
-	}
+	//if err := unix.Setpgid(0, 0); err != nil {
+	//	log.Fatal(err)
+	//}
 
 	err = syscall.Exec(binPath, *cmd, os.Environ())
 	// should never be reached
